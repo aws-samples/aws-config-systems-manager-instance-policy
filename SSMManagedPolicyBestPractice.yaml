@@ -1,0 +1,284 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Create AWS Config rules to scan IAM roles, users and groups for IAM policy attachment, with an Automation remediation document to replace the policy on IAM roles with the specified policy or policies. Requires AWS Config to first be enabled.
+Parameters:
+  DocumentName:
+    Description: >-
+      Name of the Automation remediation document. Must not begin with reserved prefixes: aws, amazon, or amzn.
+    Type: String
+    MinLength: "3"
+    MaxLength: "128"
+    Default: ConfigRemediateIamPolicy
+    ConstraintDescription: This parameter is required.
+  RoleConfigRuleName:
+    Type: String
+    Default: Iam-Roles-Deprecated-AmazonEC2RoleforSSM
+    Description: The name that you assign to the AWS Config rule to scan and remediate IAM roles.
+    MinLength: "1"
+    MaxLength: "128"
+    ConstraintDescription: This parameter is required.
+  UserGroupConfigRuleName:
+    Type: String
+    Default: Iam-UsersGroups-Deprecated-AmazonEC2RoleforSSM
+    Description: The name that you assign to the AWS Config rule to scan IAM users and groups.
+    MinLength: "1"
+    MaxLength: "128"
+    ConstraintDescription: This parameter is required.
+  exceptionList:
+    Type: String
+    Default: ""
+    Description: >-
+      Comma separated list of resourcetypes and list of resource name pairs to exclude from Config rule scan.
+      (for example, users:[user1;user2], groups:[group1;group2], roles:[role1;role2;role3]).
+  policyToRemove:
+    Description: >-
+      ARN of the IAM policy to scan in AWS Config rule and remediate by replacing with "policiesToAdd"
+    Type: String
+    Default: 'arn:aws:iam::aws:policy/service-role/AmazonEC2RoleforSSM'
+    MinLength: "1"
+    ConstraintDescription: This parameter is required.
+  policiesToAdd:
+    Description: >-
+      ARN(s) of an IAM policy or policies to attach to the role, in comma separated list format. Note the default limit is 10 policies attached to a role.
+    Type: String
+    Default: 'arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore,arn:aws:iam::aws:policy/AmazonSSMDirectoryServiceAccess,arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy'
+    MinLength: "1"
+    ConstraintDescription: This parameter is required.
+Resources:
+  RemediationDocument: 
+    Type: "AWS::SSM::Document"
+    Properties:
+      DocumentType: Automation
+      Name: !Ref "DocumentName"
+      Content:
+        description: >-
+          Remove a selected policy from an IAM role resource discovered by AWS Config
+          rule, and replace it with a new policy.
+        schemaVersion: '0.3'
+        assumeRole: '{{AutomationAssumeRole}}'
+        outputs:
+          - describeResourceId.RoleName
+          - attachNewRolePolicies.OutputPayload
+        parameters:
+          ResourceId:
+            type: String
+            description: >-
+              (Required) The UniqueId name of the target role on which to replace the
+              chosen policy.
+          PolicyToRemove:
+            type: String
+            description: >-
+              (Required) The IAM policy ARN to remove from the role.
+          NewPolicies:
+            type: StringList
+            description: >-
+              (Required) ARN(s) of an IAM policy or policies to attach to the role, in comma separated list format.
+          AutomationAssumeRole:
+            type: String
+            default: ''
+            description: >-
+              (Required) The ARN of the role that allows Automation to perform the
+              actions on your behalf.
+        mainSteps:
+          - name: describeResourceId
+            action: 'aws:executeAwsApi'
+            maxAttempts: 2
+            onFailure: Abort
+            inputs:
+              Service: config
+              Api: ListDiscoveredResources
+              resourceType: 'AWS::IAM::Role'
+              resourceIds:
+                - '{{ ResourceId }}'
+            outputs:
+              - Name: RoleName
+                Type: String
+                Selector: '$.resourceIdentifiers[0].resourceName'
+            isCritical: 'true'
+            nextStep: attachNewRolePolicies
+          - name: attachNewRolePolicies
+            action: 'aws:executeScript'
+            maxAttempts: 2
+            inputs:
+              Runtime: python3.7
+              Handler: replace_old_policies
+              InputPayload:
+                roleName: '{{ describeResourceId.RoleName }}'
+                newPolicies: '{{ NewPolicies }}'
+                PolicyToRemove: '{{ PolicyToRemove }}'
+              Script: |-
+                import boto3
+                iam = boto3.client('iam')
+          
+                def is_policy_attached(role_name, policy_arn):
+                    results_per_page = 10
+                    there_is_more = True
+                    marker = ''
+                    while there_is_more:
+                        if marker == '':
+                            response = iam.list_attached_role_policies(
+                                RoleName=role_name,
+                                MaxItems=results_per_page
+                            )
+                        else:
+                            response = iam.list_attached_role_policies(
+                                RoleName=role_name,
+                                Marker=marker,
+                                MaxItems=results_per_page
+                            )
+                        for policy in response['AttachedPolicies']:
+                            if policy['PolicyArn'] == policy_arn:
+                                return True
+                        there_is_more = response['IsTruncated']
+                        if there_is_more:
+                            marker = response['Marker']
+                    return False
+          
+          
+                def attach_new_policies(role_name, new_policies):
+                    for policy in new_policies:
+                        iam.attach_role_policy(RoleName=role_name, PolicyArn=policy.strip())
+                        print('[INFO]: Attaching policy: ', policy.strip())
+          
+          
+                def detach_old_policy(role_name, policy_arn):
+                    if is_policy_attached(role_name, policy_arn):
+                        iam.detach_role_policy(RoleName=role_name, PolicyArn=policy_arn)
+          
+          
+                def replace_old_policies(events, context):
+                    role_name = events['roleName']
+                    new_policies = events['newPolicies']
+                    old_policy = events['PolicyToRemove']
+          
+                    print('[INFO]: Attaching replacement policies')
+                    attach_new_policies(role_name, new_policies)
+          
+                    print('[INFO]: Detaching noncomplying policy')
+                    detach_old_policy(role_name, old_policy)
+          
+                    return {'roleName': role_name}
+            isCritical: 'true'
+            isEnd: true
+
+  AWSConfigRuleIamRole:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      ConfigRuleName:
+        Ref: RoleConfigRuleName
+      Description: >-
+        Checks that none of your IAM roles (excluding
+        exceptionList) have the specified policies attached.
+      InputParameters:
+        policyArns: !Ref policyToRemove
+        exceptionList:
+          Fn::If:
+            - exceptionList
+            - Ref: exceptionList
+            - Ref: AWS::NoValue
+      Scope:
+        ComplianceResourceTypes:
+          - AWS::IAM::Role
+      Source:
+        Owner: AWS
+        SourceIdentifier: IAM_POLICY_BLACKLISTED_CHECK
+
+  AWSConfigRuleIamUserGroup:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      ConfigRuleName:
+        Ref: UserGroupConfigRuleName
+      Description: >-
+        Checks that none of your IAM users or groups (excluding
+        exceptionList) have the specified policies attached.
+      InputParameters:
+        policyArns: !Ref policyToRemove
+        exceptionList:
+          Fn::If:
+            - exceptionList
+            - Ref: exceptionList
+            - Ref: AWS::NoValue
+      Scope:
+        ComplianceResourceTypes:
+          - AWS::IAM::User
+          - AWS::IAM::Group
+      Source:
+        Owner: AWS
+        SourceIdentifier: IAM_POLICY_BLACKLISTED_CHECK
+
+  iamRemediationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+              - 'ssm.amazonaws.com'
+            Action:
+              - 'sts:AssumeRole'
+      Policies:
+        - PolicyName: 'AllowIamAutomationPolicyRemediation'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+            - Effect: Allow
+              Action: 
+                - iam:ListAttachedRolePolicies
+                - iam:AttachRolePolicy
+                - config:ListDiscoveredResources
+              Resource: "*"
+            - Effect: Allow
+              Action: iam:DetachRolePolicy
+              Resource: arn:aws:iam::*:role/*
+              Condition:
+                ForAllValues:ArnEquals:
+                  iam:PolicyARN: !Ref policyToRemove
+
+  AWSConfigRemediationConfig:
+    Type: "AWS::Config::RemediationConfiguration"
+    DependsOn: AWSConfigRuleIamRole
+    Properties:
+      ConfigRuleName:
+        Ref: RoleConfigRuleName
+      Parameters:
+        AutomationAssumeRole:
+          StaticValue:
+            Values: 
+            - Fn::GetAtt: [ iamRemediationRole, Arn ]
+        PolicyToRemove:
+          StaticValue:
+            Values:
+            - Ref: policyToRemove
+        NewPolicies:
+          StaticValue:
+            Values: !Split 
+              - ","
+              - !Ref policiesToAdd
+        ResourceId:
+          ResourceValue:
+            Value: RESOURCE_ID
+      TargetId: !Ref RemediationDocument
+      TargetType: "SSM_DOCUMENT"
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Required
+        Parameters:
+          - policyToRemove
+          - policiesToAdd
+          - RoleConfigRuleName
+          - UserGroupConfigRuleName
+          - DocumentName
+      - Label:
+          default: Optional
+        Parameters:
+          - exceptionList
+Conditions:
+  exceptionList:
+    Fn::Not:
+      - Fn::Equals:
+          - ""
+          - Ref: exceptionList
