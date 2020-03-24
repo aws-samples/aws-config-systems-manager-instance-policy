@@ -11,7 +11,7 @@ This is a sample solution using [AWS Config](https://aws.amazon.com/config/) rul
 ### Prerequisites
 To deploy the sample solution, you must first enable [AWS Config](https://aws.amazon.com/config/) and collect IAM resource types IAM:Role, IAM:User, and IAM:Group. If you choose to collect all resources, ensure *Include global resources* is enabled.
 
-Once AWS Config is enabled, use the [AWS CloudFormation](https://aws.amazon.com/cloudformation/) template provided in this project. The resulting CloudFormation stack will create the following resources:
+Once AWS Config is enabled, use the [AWS CloudFormation](https://aws.amazon.com/cloudformation/) template provided in this project, found here: [SSMManagedPolicyBestPractice.yaml](SSMManagedPolicyBestPractice.yaml). The resulting CloudFormation stack will create the following resources:
 
 * AWS Config rule to scan/remediate IAM roles
 * AWS Config rule to scan IAM users and groups
